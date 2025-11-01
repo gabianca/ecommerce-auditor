@@ -39,15 +39,148 @@ SEASON_MAP = {
 
 app = FastAPI(title="Ecommerce Auditor", version="0.1.0")
 
-async def grab_html(url: str) -> str:
-    """Apre la pagina con Playwright (browser headless) e restituisce l'HTML renderizzato."""
+async def grab_html(url: str, extra_wait_ms: int = 1200) -> str:
+    from playwright.async_api import async_playwright
     async with async_playwright() as p:
         browser = await p.chromium.launch()
-        page = await browser.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=20000)
+        ctx = await browser.new_context(viewport={"width": 1366, "height": 900})
+        page = await ctx.new_page()
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+
+        # Prova a chiudere cookie banner comuni
+        for sel in [
+            "button#onetrust-accept-btn-handler",
+            "button[aria-label*='Accept']",
+            "button:has-text('Accetta')",
+            "button:has-text('Accept')",
+            "button:has-text('OK')",
+            "[data-testid='cookie-accept']",
+        ]:
+            try:
+                btn = await page.query_selector(sel)
+                if btn:
+                    await btn.click(timeout=500)
+                    await page.wait_for_timeout(300)
+            except:
+                pass
+
+        # Scroll lento per attivare lazy-load/caroselli
+        total_height = await page.evaluate("() => document.body.scrollHeight")
+        y = 0
+        while y < total_height:
+            y += 700
+            await page.evaluate(f"() => window.scrollTo(0, {y})")
+            await page.wait_for_timeout(250)
+            total_height = await page.evaluate("() => document.body.scrollHeight")
+
+        # Attendi un attimo per JS lenti
+        await page.wait_for_timeout(extra_wait_ms)
+
         html = await page.content()
         await browser.close()
         return html
+async def detect_carousels_js(url: str) -> dict:
+    """
+    Rileva caroselli sia per classi note sia per overflow orizzontale.
+    Restituisce {"hasCarousel": bool, "labelsFound": [etichette]}
+    """
+    from playwright.async_api import async_playwright
+    import re
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        ctx = await browser.new_context(viewport={"width": 1366, "height": 900})
+        page = await ctx.new_page()
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+
+        # Cookie banner
+        for sel in [
+            "button#onetrust-accept-btn-handler",
+            "button[aria-label*='Accept']",
+            "button:has-text('Accetta')",
+            "button:has-text('Accept')",
+            "button:has-text('OK')",
+            "[data-testid='cookie-accept']",
+        ]:
+            try:
+                btn = await page.query_selector(sel)
+                if btn:
+                    await btn.click(timeout=500)
+                    await page.wait_for_timeout(300)
+            except:
+                pass
+
+        # Scroll per attivare slider/lazy
+        total = await page.evaluate("() => document.body.scrollHeight")
+        y = 0
+        while y < total:
+            y += 700
+            await page.evaluate(f"() => window.scrollTo(0, {y})")
+            await page.wait_for_timeout(250)
+            total = await page.evaluate("() => document.body.scrollHeight")
+        await page.wait_for_timeout(800)
+
+        # Detection in JS: classi note + overflow orizzontale + headings vicini
+        result = await page.evaluate("""
+() => {
+  const labels = [];
+  const classRegex = /(swiper|slick|owl-carousel|glide|flickity|splide|carousel)/i;
+
+  let hasKnown = !!document.querySelector(
+    '.swiper, .slick-slider, .owl-carousel, .glide, .flickity-enabled, .splide, [class*="carousel"]'
+  );
+
+  // overflow orizzontale con molte card prodotto
+  const horizCandidates = Array.from(document.querySelectorAll('*'))
+    .filter(el => {
+      const s = getComputedStyle(el);
+      const isHoriz = (s.overflowX === 'auto' || s.overflowX === 'scroll');
+      const wide = el.scrollWidth > el.clientWidth * 1.2;
+      // contiene più di 4 card/figure/link prodotto
+      const items = el.querySelectorAll('li, .card, .product, .product-card, article, figure, .grid__item, .product-item');
+      return (isHoriz || wide) && items.length >= 4;
+    });
+
+  let hasOverflowCarousel = horizCandidates.length > 0;
+
+  // Etichette vicine (headings/aria-label)
+  function textNear(el) {
+    let t = '';
+    // heading precedente
+    let prev = el.previousElementSibling;
+    for (let i=0;i<3 && prev;i++){
+      if (/^H[1-6]$/.test(prev.tagName)) { t += ' ' + prev.textContent.trim(); }
+      prev = prev.previousElementSibling;
+    }
+    // aria-label / aria-labelledby
+    const aria = el.getAttribute('aria-label') || '';
+    if (aria) t += ' ' + aria;
+    return t.trim().slice(0,120);
+  }
+
+  const allCaros = [];
+  if (hasKnown) {
+    allCaros.push(...Array.from(document.querySelectorAll(
+      '.swiper, .slick-slider, .owl-carousel, .glide, .flickity-enabled, .splide, [class*="carousel"]'
+    )));
+  }
+  allCaros.push(...horizCandidates);
+
+  const lab = new Set();
+  const kw = /(visti di recente|correlat|acquistati insieme|potrebbe interessarti|pi[uù] vendut|novit|consigliat|trending|best|top|recommended|related|recent)/i;
+  allCaros.slice(0, 10).forEach(el => {
+    const t = textNear(el);
+    if (kw.test(t)) lab.add(t);
+  });
+
+  return {
+    hasCarousel: hasKnown || hasOverflowCarousel,
+    labelsFound: Array.from(lab)
+  };
+}
+        """)
+        await browser.close()
+        return result or {"hasCarousel": False, "labelsFound": []}
+
 
 def extract_scripts(soup: BS) -> List[str]:
     out = []
@@ -194,23 +327,42 @@ async def audit(url: str):
     vendor = detect_vendor(home_html, scripts)
 
     # 2) Link candidati a PDP e Carrello
-    links = [a.get("href") for a in soup.select("a[href]") if a.get("href")]
-    pdp = next((l for l in links if re.search(r"/product|/prodotti|/produto|/item|/p/", l, re.I)), None)
-    cart = next((l for l in links if re.search(r"cart|carrello", l, re.I)), None)
+links = [a.get("href") for a in soup.select("a[href]") if a.get("href")]
+# PDP: più pattern + product schema
+pdp = next((l for l in links if re.search(r"/product|/prodotti|/produto|/item|/p/|/prod-|-p\\d+|/detail", l, re.I)), None)
+if not pdp:
+    # prova a trovare la prima pagina che contiene schema.org/Product
+    for l in links[:50]:
+        test_url = absolutize(url, l)
+        try:
+            html_test = await grab_html(test_url, extra_wait_ms=600)
+            if '"@type":"Product"' in html_test or 'itemtype="http://schema.org/Product"' in html_test.lower():
+                pdp = l
+                break
+        except:
+            pass
+
+# Carrello: più pattern
+cart = next((l for l in links if re.search(r"cart|carrello|checkout|basket|bag", l, re.I)), None)
+
 
     pages_text = soup.get_text(" ", strip=True)
-    home_caro = where_carousels(soup)
+    home_caro = await detect_carousels_js(url)
 
     # 3) PDP
     pdp_caro = {}
-    if pdp:
-        try:
-            pdp_html = await grab_html(absolutize(url, pdp))
-            pdp_soup = BS(pdp_html, "lxml")
-            pdp_caro = where_carousels(pdp_soup)
-            pages_text += " " + pdp_soup.get_text(" ", strip=True)
-        except:
-            pdp_caro = {}
+if pdp:
+    try:
+        pdp_caro = await detect_carousels_js(absolutize(url, pdp))
+    except:
+        pdp_caro = {}
+
+cart_caro = {}
+if cart:
+    try:
+        cart_caro = await detect_carousels_js(absolutize(url, cart))
+    except:
+        cart_caro = {}
 
     # 4) Carrello
     cart_caro = {}
