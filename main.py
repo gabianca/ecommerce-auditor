@@ -1,5 +1,5 @@
-# main.py
-import re, asyncio, xml.etree.ElementTree as ET, json
+# main.py (v0.3)
+import re, json, base64, xml.etree.ElementTree as ET
 from typing import Dict, List
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -18,32 +18,63 @@ VENDOR_SIGNS = {
     "Elastic/Custom": [r"_search\b", r"\bmeilisearch\b"],
 }
 
-CAROUSEL_CLASS_SELECTOR = (
+CAROUSEL_SELECTOR = (
     ".swiper, .slick-slider, .owl-carousel, .glide, .flickity-enabled, .splide, [class*='carousel']"
+)
+
+KW_LABELS = re.compile(
+    r"(visti di recente|correlat|acquistati insieme|potrebbe interessarti|pi[uù] vendut|nuovi arrivi|novit|consigliat|"
+    r"in evidenza|trending|best|top|recommended|related|recent|collezion|promo|saldi|outlet|look|completa il)",
+    re.I
 )
 
 SEASON_MAP = {
     "ski|sci|snow": "nov–mar",
-    "mare|piscina|costum": "mag–ago",
-    "barbecue|griglia|giardino": "apr–lug",
-    "scuola|zaino|astuccio": "ago–set",
+    "mare|piscina|costum|beach|swim": "mag–ago",
+    "barbecue|griglia|giardino|garden|outdoor": "apr–lug",
+    "scuola|zaino|astuccio|back to school": "ago–set",
     "natale|christmas|regali": "nov–dic",
     "halloween": "ott",
 }
 
-app = FastAPI(title="Ecommerce Auditor", version="0.2.0")
+app = FastAPI(title="Ecommerce Auditor", version="0.3.0")
 
 def absolutize(base: str, href: str) -> str:
     if href.startswith("http://") or href.startswith("https://"): return href
     return base.rstrip("/") + "/" + href.lstrip("/")
 
+# ---------- Stealth context (anti-bot / realistic Chrome)
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+STEALTH_JS = """
+// Rimuovi navigator.webdriver
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+// Fingi plugin/mime
+Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
+Object.defineProperty(navigator, 'languages', {get: () => ['it-IT','it','en']});
+"""
+
 async def _open_page(url: str, width=1366, height=900):
     p = await async_playwright().start()
-    browser = await p.chromium.launch()
-    ctx = await browser.new_context(viewport={"width": width, "height": height})
+    browser = await p.chromium.launch(
+        headless=True,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ],
+    )
+    ctx = await browser.new_context(
+        viewport={"width": width, "height": height},
+        user_agent=UA,
+        java_script_enabled=True,
+        locale="it-IT",
+    )
     page = await ctx.new_page()
-    await page.goto(url, wait_until="networkidle", timeout=45000)
-    # cookie banners più comuni
+    await page.add_init_script(STEALTH_JS)
+    await page.goto(url, wait_until="networkidle", timeout=60000)
+
+    # Cookie banners più comuni
     for sel in [
         "button#onetrust-accept-btn-handler",
         "button[aria-label*='Accept']",
@@ -51,23 +82,25 @@ async def _open_page(url: str, width=1366, height=900):
         "button:has-text('Accept')",
         "button:has-text('OK')",
         "[data-testid='cookie-accept']",
+        "button#accept-cookies", "button.cookie-accept", "button:has-text('Ho capito')"
     ]:
         try:
             btn = await page.query_selector(sel)
             if btn:
-                await btn.click(timeout=700)
+                await btn.click(timeout=800)
                 await page.wait_for_timeout(300)
         except:
             pass
-    # scroll per lazy-load
+
+    # Scroll per attivare lazy-load
     total = await page.evaluate("() => document.body.scrollHeight")
     y = 0
     while y < total:
-        y += 800
+        y += 900
         await page.evaluate(f"() => window.scrollTo(0, {y})")
-        await page.wait_for_timeout(250)
+        await page.wait_for_timeout(300)
         total = await page.evaluate("() => document.body.scrollHeight")
-    await page.wait_for_timeout(1200)
+    await page.wait_for_timeout(1500)
     return p, browser, page
 
 async def grab_html(url: str) -> str:
@@ -76,6 +109,7 @@ async def grab_html(url: str) -> str:
     await browser.close(); await p.stop()
     return html
 
+# ---------- Vendor detection
 def extract_scripts(soup: BS) -> List[str]:
     out = []
     for s in soup.select("script[src]"): out.append(s.get("src",""))
@@ -92,12 +126,13 @@ def detect_vendor(html: str, scripts: List[str]) -> str:
         return "Base/native (Woo/Shopify)"
     return "Non chiaro (prob. base/custom)"
 
+# ---------- Catalog size (sitemap)
 async def count_products_from_sitemap(origin: str) -> int | None:
     base = origin.rstrip("/")
     for path in ["/sitemap.xml", "/sitemap_index.xml"]:
         url = base + path
         try:
-            r = httpx.get(url, timeout=10)
+            r = httpx.get(url, timeout=12)
             if r.status_code != 200: continue
             root = ET.fromstring(r.text)
             ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
@@ -105,15 +140,16 @@ async def count_products_from_sitemap(origin: str) -> int | None:
             prod_sitemaps = [l for l in locs if re.search(r'product', l, re.I)] or locs
             total = 0
             for sm in prod_sitemaps[:5]:
-                rr = httpx.get(sm, timeout=10)
+                rr = httpx.get(sm, timeout=12)
                 if rr.status_code != 200: continue
                 rr_root = ET.fromstring(rr.text)
                 total += len(rr_root.findall(".//sm:url", ns))
             return total if total>0 else None
-        except Exception:
+        except:
             continue
     return None
 
+# ---------- Seasonality
 def season_guess(text: str):
     hits = []
     for patt, months in SEASON_MAP.items():
@@ -122,12 +158,15 @@ def season_guess(text: str):
     months = ", ".join(sorted(set(hits)))
     return {"stagionale": True, "alta": months, "confidenza": "media"}
 
+# ---------- Carousels (DOM + iframes)
 async def detect_carousels_js(url: str) -> dict:
     p, browser, page = await _open_page(url)
-    result = await page.evaluate(f"""
+
+    async def probe(frame):
+        return await frame.evaluate(f"""
 () => {{
   const labels = new Set();
-  const known = document.querySelectorAll("{CAROUSEL_CLASS_SELECTOR}");
+  const known = document.querySelectorAll("{CAROUSEL_SELECTOR}");
   // overflow orizzontale
   const horiz = Array.from(document.querySelectorAll('*')).filter(el => {{
     const s = getComputedStyle(el);
@@ -136,11 +175,10 @@ async def detect_carousels_js(url: str) -> dict:
     const items = el.querySelectorAll('li, .card, .product, .product-card, article, figure, .grid__item, .product-item');
     return (horiz || wide) && items.length >= 4;
   }});
-  const all = Array.from(known).concat(horiz).slice(0, 15);
+  const all = Array.from(known).concat(horiz).slice(0, 20);
 
   function nearText(el){{
     let t = '';
-    // heading precedente
     let prev = el.previousElementSibling, i=0;
     while(prev && i<4){{
       if(/^H[1-6]$/.test(prev.tagName)) t += ' ' + prev.textContent.trim();
@@ -148,42 +186,49 @@ async def detect_carousels_js(url: str) -> dict:
     }}
     const aria = el.getAttribute('aria-label') || '';
     if(aria) t += ' ' + aria;
-    if(el.parentElement){{
-      const ptxt = el.parentElement.querySelector('h2,h3,h4,[aria-label]');
-      if(ptxt) t += ' ' + ptxt.textContent.trim();
-    }}
+    const h = el.parentElement && el.parentElement.querySelector('h2,h3,h4,[aria-label]');
+    if(h) t += ' ' + h.textContent.trim();
     return t.trim();
   }}
 
-  const kw = /(visti di recente|correlat|acquistati insieme|potrebbe interessarti|pi[uù] vendut|novit|consigliat|trending|best|top|recommended|related|recent|piu venduti|i piu venduti)/i;
+  const kw = {KW_LABELS.pattern};
   all.forEach(el => {{
     const t = nearText(el);
     if (kw.test(t)) labels.add(t.slice(0,120));
   }});
   return {{
+    knownCount: known.length,
+    horizCount: horiz.length,
     hasCarousel: all.length > 0,
     labelsFound: Array.from(labels)
   }};
 }}
 """)
-    # prepara dati debug
-    debug = await page.evaluate(f"""
-() => {{
-  return {{
-    knownCount: document.querySelectorAll("{CAROUSEL_CLASS_SELECTOR}").length,
-    hasHorizontal: Array.from(document.querySelectorAll('*')).some(el => {{
-      const s = getComputedStyle(el);
-      const horiz = (s.overflowX === 'auto' || s.overflowX === 'scroll');
-      const wide = el.scrollWidth > el.clientWidth * 1.2;
-      const items = el.querySelectorAll('li, .card, .product, .product-card, article, figure, .grid__item, .product-item');
-      return (horiz || wide) && items.length >= 4;
-    }})
-  }};
-}}
-""")
-    await browser.close(); await p.stop()
-    return {"hasCarousel": bool(result.get("hasCarousel")), "labelsFound": result.get("labelsFound", []), "_debug": debug}
 
+    # pagina principale
+    summary = await probe(page.main_frame)
+
+    # iframes (se presenti)
+    try:
+        for f in page.frames:
+            if f == page.main_frame: continue
+            try:
+                r = await probe(f)
+                summary["knownCount"] += r.get("knownCount",0)
+                summary["horizCount"] += r.get("horizCount",0)
+                summary["hasCarousel"] = summary["hasCarousel"] or r.get("hasCarousel", False)
+                for lab in r.get("labelsFound", []):
+                    if lab not in summary["labelsFound"]:
+                        summary["labelsFound"].append(lab)
+            except:
+                pass
+    except:
+        pass
+
+    await browser.close(); await p.stop()
+    return summary
+
+# ---------- Routes
 @app.get("/")
 def root():
     return {"ok": True, "try": "/audit?url=https://esempio.com", "more": ["/docs", "/audit/html?url=https://demo.opencart.com/"]}
@@ -199,10 +244,11 @@ async def audit(url: str):
     scripts = extract_scripts(soup)
     vendor = detect_vendor(home_html, scripts)
 
+    # PDP e Cart heuristics
     links = [a.get("href") for a in soup.select("a[href]") if a.get("href")]
     pdp = next((l for l in links if re.search(r"/product|/prodotti|/produto|/item|/p/|/detail|/prod-", l, re.I)), None)
     if not pdp:
-        for l in links[:50]:
+        for l in links[:60]:
             test_url = absolutize(url, l)
             try:
                 h = await grab_html(test_url)
@@ -212,13 +258,12 @@ async def audit(url: str):
     cart = next((l for l in links if re.search(r"cart|carrello|checkout|basket|bag", l, re.I)), None)
 
     pages_text = soup.get_text(" ", strip=True)
-    home_caro = await detect_carousels_js(url)
 
+    home_caro = await detect_carousels_js(url)
     pdp_caro = {}
     if pdp:
         try: pdp_caro = await detect_carousels_js(absolutize(url, pdp))
         except: pdp_caro = {}
-
     cart_caro = {}
     if cart:
         try: cart_caro = await detect_carousels_js(absolutize(url, cart))
@@ -238,9 +283,9 @@ async def audit(url: str):
     return JSONResponse({
         "search_engine": vendor,
         "carousels": {
-            "home": {k:v for k,v in home_caro.items() if k!='_debug'},
-            "product": {k:v for k,v in (pdp_caro or {"hasCarousel": False}).items() if k!='_debug'},
-            "cart": {k:v for k,v in (cart_caro or {"hasCarousel": False}).items() if k!='_debug'}
+            "home": {"hasCarousel": bool(home_caro.get("hasCarousel")), "labelsFound": home_caro.get("labelsFound", [])},
+            "product": {"hasCarousel": bool(pdp_caro.get("hasCarousel"))} if pdp_caro else {"hasCarousel": False},
+            "cart": {"hasCarousel": bool(cart_caro.get("hasCarousel"))} if cart_caro else {"hasCarousel": False},
         },
         "catalog_size_estimate": count,
         "seasonality": season,
@@ -268,8 +313,8 @@ async def audit_html(url: str):
         <table>
           <tr><th>Pagina</th><th>Ha caroselli?</th><th>Etichette trovate</th></tr>
           <tr><td>Home</td><td>{yesno(h.get("hasCarousel", False))}</td><td>{", ".join(h.get("labelsFound", [])) or "-"}</td></tr>
-          <tr><td>PDP</td><td>{yesno(p.get("hasCarousel", False))}</td><td>{", ".join(p.get("labelsFound", [])) or "-"}</td></tr>
-          <tr><td>Carrello</td><td>{yesno(c.get("hasCarousel", False))}</td><td>{", ".join(c.get("labelsFound", [])) or "-"}</td></tr>
+          <tr><td>PDP</td><td>{yesno(p.get("hasCarousel", False))}</td><td>-</td></tr>
+          <tr><td>Carrello</td><td>{yesno(c.get("hasCarousel", False))}</td><td>-</td></tr>
         </table>
       </div>
       <div class="card"><h2>Catalogo</h2><p><b>Stima numero prodotti:</b> {size if size is not None else "Non determinabile"}</p></div>
@@ -281,6 +326,13 @@ async def audit_html(url: str):
 
 @app.get("/audit/debug")
 async def audit_debug(url: str):
-    # utile per capire perché non vede i caroselli
-    hc = await detect_carousels_js(url)
-    return {"carousels_raw": hc}
+    data = await detect_carousels_js(url)
+    return data
+
+@app.get("/audit/screenshot", response_class=HTMLResponse)
+async def audit_screenshot(url: str):
+    p, browser, page = await _open_page(url, width=1366, height=2000)
+    b = await page.screenshot(full_page=True)
+    b64 = base64.b64encode(b).decode("ascii")
+    await browser.close(); await p.stop()
+    return HTMLResponse(f'<html><body><img style="max-width:100%" src="data:image/png;base64,{b64}"/></body></html>')
