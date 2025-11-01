@@ -118,6 +118,68 @@ def absolutize(base: str, href: str) -> str:
 @app.get("/")
 def root():
     return {"ok": True, "try": "/audit?url=https://esempio.com"}
+from fastapi.responses import HTMLResponse
+
+@app.get("/audit/html", response_class=HTMLResponse)
+async def audit_html(url: str):
+    data = await audit(url)  # riusa la logica esistente
+    # Se JSONResponse, prendi il .body
+    if hasattr(data, "body"):
+        import json
+        data = json.loads(data.body)
+
+    se = data.get("search_engine", "N/D")
+    car = data.get("carousels", {})
+    size = data.get("catalog_size_estimate")
+    seas = data.get("seasonality", {})
+    gaps = data.get("quick_gaps", [])
+
+    def yesno(b): return "✅" if b else "❌"
+    h = car.get("home", {})
+    p = car.get("product", {})
+    c = car.get("cart", {})
+
+    html = f"""
+    <html><head><meta charset="utf-8"><title>Audit eCommerce</title>
+    <style>
+      body{{font-family:system-ui, Arial; max-width:900px; margin:40px auto; line-height:1.5}}
+      .card{{padding:16px; border:1px solid #ddd; border-radius:10px; margin:12px 0}}
+      h1{{margin:0 0 10px}}
+      table{{border-collapse:collapse; width:100%}}
+      td, th{{border:1px solid #ddd; padding:8px; text-align:left}}
+      .badge{{display:inline-block; padding:2px 8px; border-radius:999px; background:#f2f2f2; margin-right:6px}}
+    </style>
+    </head><body>
+      <h1>Audit eCommerce</h1>
+      <div class="card">
+        <h2>Motore di ricerca</h2>
+        <p><strong>Rilevato:</strong> {se}</p>
+      </div>
+      <div class="card">
+        <h2>Caroselli / Cross-sell</h2>
+        <table>
+          <tr><th>Pagina</th><th>Ha caroselli?</th><th>Etichette trovate</th></tr>
+          <tr><td>Home</td><td>{yesno(h.get("hasCarousel", False))}</td><td>{" ".join(f"<span class='badge'>{x}</span>" for x in h.get("labelsFound", [])) or "-"}</td></tr>
+          <tr><td>PDP</td><td>{yesno(p.get("hasCarousel", False))}</td><td>{" ".join(f"<span class='badge'>{x}</span>" for x in p.get("labelsFound", [])) or "-"}</td></tr>
+          <tr><td>Carrello</td><td>{yesno(c.get("hasCarousel", False))}</td><td>{" ".join(f"<span class='badge'>{x}</span>" for x in c.get("labelsFound", [])) or "-"}</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h2>Catalogo</h2>
+        <p><strong>Stima numero prodotti:</strong> {size if size is not None else "Non determinabile"}</p>
+      </div>
+      <div class="card">
+        <h2>Stagionalità</h2>
+        <p>{("Stagionale" if seas.get("stagionale") else "Non stagionale o incerto")} – confidenza: {seas.get("confidenza","-")}
+        {(" – Alta: " + seas.get("alta","")) if seas.get("stagionale") else ""}</p>
+      </div>
+      <div class="card">
+        <h2>GAP rapidi</h2>
+        <ul>{"".join(f"<li>{g}</li>" for g in gaps) or "<li>Nessun gap evidente</li>"}</ul>
+      </div>
+    </body></html>
+    """
+    return HTMLResponse(html)
 
 @app.get("/audit")
 async def audit(url: str):
